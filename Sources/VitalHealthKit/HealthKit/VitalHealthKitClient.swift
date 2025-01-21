@@ -57,6 +57,8 @@ public enum PermissionOutcome: Equatable {
   let syncSerializerLock = NSLock()
   var syncSerializer: [RemappedVitalResource: ParkingLot] = [:]
 
+  private static var syncAlongsideTasks: [VitalResource: (VitalResource) async -> Void] = [:]
+
   private var scope = SupervisorScope()
 
   private var isAutoSyncConfigured: Bool {
@@ -847,11 +849,15 @@ extension VitalHealthKitClient {
       return
     }
 
-    VitalLogger.healthKit.info("[\(description)] begin \(tags)", source: "Sync")
-
     guard let configuration = configuration.value else {
       VitalLogger.healthKit.info("[\(description)] configuration unavailable", source: "Sync")
       return
+    }
+
+    VitalLogger.healthKit.info("[\(description)] begin \(tags)", source: "Sync")
+
+    let syncAlongside = Self.syncAlongsideTasks[resource].map { action in
+      Task { await action(resource) }
     }
 
     progressStore.recordSync(syncID, .started)
@@ -876,6 +882,11 @@ extension VitalHealthKitClient {
     // IMPORTANT: Must be called on ALL exit paths below.
     // Pay extra attention when doing early exits with returns and throws.
     func syncEnded(success: Bool) async {
+      if let task = syncAlongside {
+        // Wait for any sync-alongside task to complete, but we don't care about the result.
+        _ = await task.result
+      }
+
       if success {
         scheduleDeprioritizedResourceRetries()
       }
@@ -1244,6 +1255,21 @@ extension VitalHealthKitClient {
   public static func write(input: DataInput, startDate: Date, endDate: Date) async throws -> Void {
     let store = HKHealthStore()
     try await VitalHealthKit.write(healthKitStore: store, dataInput: input, startDate: startDate, endDate: endDate)
+  }
+}
+
+extension VitalHealthKitClient {
+
+  /// Do your own work alongside a sync attempt of a specific VitalResource.
+  ///
+  /// Note that while your work cannot fail the sync attempt of a VitalResource, the sync attempt will wait for your work to complete
+  /// before marking itself as successful, and notifying Apple HealthKit of the work completion.
+  ///
+  /// - important: You must register all logic before you call `VitalHealthKitClient.automaticConfiguration()` in
+  /// your App Delegate.
+  public static func syncAlongside(_ resource: VitalResource, action: @escaping (VitalResource) async -> Void) {
+    dispatchPrecondition(condition: .onQueue(.main))
+    syncAlongsideTasks[resource] = action
   }
 }
 
